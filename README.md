@@ -175,6 +175,18 @@ min_rtt_ms 1  bdp  51  aggr  50  cwnd 101     (slow, for the whole ten-second wi
 
 ### A change that removes both
 
+> **Later finding: this patch is not a fix as it stands.** The figures in this section are from
+> runs of 25 to 100 seconds. On a 12 GB run over the same Wi-Fi in the other direction, libudx
+> main with this patch on both ends averaged 21.8 MB/s (median 9.9) against 36.0 MB/s (median
+> 40.7) for udx-native 1.22.1. There the unloaded round trip is about 1.4 ms and the loaded one
+> 3 ms or more, so a window of `2 * bw * min_rtt` with the exact minimum holds less than one
+> loaded round trip and the rate shrinks; rounding 1.4 ms up to 2 ms, as the released library
+> does, happens to leave enough room. The same run also showed bandwidth samples of several times
+> the link rate right after `PROBE_RTT`, followed by a burst and loss. The whole-millisecond
+> minimum is still the cause of the slow state described above, but a finer minimum alone trades
+> one failure for another on such paths.
+
+
 `libudx-microsecond-min-rtt.patch` (13 lines added, 6 removed; applies to libudx 9c9a0e7 and to
 main at e384532) records a packet's send time from `uv_hrtime()` as well, takes the round-trip
 sample for BBR in microseconds from a fresh reading when the acknowledgement is processed, and
