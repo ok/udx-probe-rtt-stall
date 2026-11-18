@@ -50,6 +50,14 @@ const sending = mode === 'send'
 const stream = udx.createStream(sending ? 1 : 2)
 stream.connect(socket, sending ? 2 : 1, Number(peerPort), peerHost)
 
+// PUNCH=1 on a receiver behind a stateful firewall: it sends first, so the sender's packets are
+// let in.
+if (process.env.PUNCH && !sending) {
+  const punch = () => socket.send(Buffer.from('punch'), Number(peerPort), peerHost).catch(() => {})
+  punch()
+  setInterval(punch, 1000).unref()
+}
+
 const started = Date.now()
 let moved = 0
 let last = 0
@@ -69,8 +77,30 @@ function line() {
 }
 const ticker = setInterval(() => console.log(line()), 1000)
 
+// Processor time of this end, printed when it exits.
+process.on('exit', () => {
+  const cpu = process.cpuUsage()
+  const total = (cpu.user + cpu.system) / 1e6
+  require('fs').writeSync(2, `cpu ${sending ? 'send' : 'recv'}: user ${(cpu.user / 1e6).toFixed(1)} s, system ${(cpu.system / 1e6).toFixed(1)} s, per GB ${(total / (moved / 1e9)).toFixed(2)} s\n`)
+})
+process.on('SIGTERM', () => process.exit(0))
+
+// FINE=<ms> FINE_OUT=<file> on the sender: the stream's state every <ms>, one line each, for
+// episodes.py. Columns: ms since start, bytes transmitted, cwnd, inflight, bbr state, rtt, bw.
+const fine = []
+const fineMs = Number(process.env.FINE || 0)
+const fineTicker = fineMs && sending
+  ? setInterval(() => {
+    fine.push([Date.now() - started, stream.bytesTransmitted, stream.cwnd, stream.inflight, stream.bbrState, stream.rtt, Math.round(stream.bbrBandwidth)].join(' '))
+  }, fineMs)
+  : null
+
 function finish() {
   clearInterval(ticker)
+  if (fineTicker) {
+    clearInterval(fineTicker)
+    require('fs').writeFileSync(process.env.FINE_OUT, fine.join('\n') + '\n')
+  }
   const seconds = (Date.now() - started) / 1000
   console.log(`done: ${moved} bytes in ${seconds.toFixed(1)} s, ${mb(moved / seconds)} MB/s average`)
   stream.destroy()

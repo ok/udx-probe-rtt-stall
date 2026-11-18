@@ -1,0 +1,101 @@
+diff --git a/include/udx.h b/include/udx.h
+index aa46f4f..8d3da37 100644
+--- a/include/udx.h
++++ b/include/udx.h
+@@ -375,6 +375,7 @@ struct udx_stream_s {
+   struct {
+     uint32_t min_rtt_ms;          // min RTT in past min_rtt_win (10 seconds). BBR.rtprop in IETF draft
+     uint64_t min_rtt_stamp;       // timestamp min_rtt_ms sample was taken.    BBR.rtprop_stamp in IETF draft
++    uint32_t min_rtt_us;          // the same minimum in microseconds; sizes the window
+     uint64_t probe_rtt_done_time; // end time for UDX_BBR_STATE_PROBE_RTT
+     win_filter_f64_t bw;          // maximum recent delivery rate in packets/ms. BBR.BtlBwFilter in IETF draft.
+     uint32_t rtt_count;           // count of packet-timed round trips. BBR.round_count in IETF draft
+@@ -479,6 +480,7 @@ struct udx_packet_s {
+   uint32_t remote_id;
+ 
+   uint64_t time_sent;
++  uint64_t time_sent_us; // high-resolution send time, for the round-trip sample
+ 
+   uint64_t stream_offset; // bytes_packetized at time of packet
+ 
+diff --git a/src/internal.h b/src/internal.h
+index 0506288..26fbc85 100644
+--- a/src/internal.h
++++ b/src/internal.h
+@@ -21,6 +21,7 @@ typedef struct {
+   uint32_t snd_interval_ms;
+   uint32_t rcv_interval_ms;
+   int64_t rtt_ms; // rs.rtt in IETF draft
++  int64_t rtt_us; // the same sample in microseconds, -1 if none
+   int losses;
+   uint32_t acked_sacked;
+   uint32_t prior_in_flight;
+diff --git a/src/udx.c b/src/udx.c
+index d8182b2..f09c9f1 100644
+--- a/src/udx.c
++++ b/src/udx.c
+@@ -764,6 +764,7 @@ _send_packet (udx_stream_t *stream, udx_packet_t *pkt, bool is_retransmit) {
+   if (is_retransmit) pkt->retransmitted = true; // true if packet was _ever_ retransmitted
+ 
+   pkt->time_sent = uv_now(stream->udx->loop);
++  pkt->time_sent_us = uv_hrtime() / 1000;
+   udx__rate_pkt_sent(stream, pkt);
+ 
+   if (pkt->lost) {
+@@ -1469,6 +1470,7 @@ ack_packet (udx_stream_t *stream, uint32_t seq, int sack, udx_rate_sample_t *rs)
+   if (!pkt->retransmitted || (rtt >= udx_rtt_min(stream))) {
+     stream->rack_rtt = rtt;
+     rs->rtt_ms = rtt;
++    rs->rtt_us = (int64_t) (uv_hrtime() / 1000 - pkt->time_sent_us);
+ 
+     if (rack_sent_after(pkt->time_sent, next, stream->rack_time_sent, stream->rack_next_seq)) {
+       stream->rack_time_sent = pkt->time_sent;
+@@ -1851,7 +1853,7 @@ process_packet (udx_socket_t *socket, char *buf, ssize_t buf_len, struct sockadd
+ 
+   bool ended = false;
+ 
+-  udx_rate_sample_t rs = {.rtt_ms = -1};
++  udx_rate_sample_t rs = {.rtt_ms = -1, .rtt_us = -1};
+ 
+   for (uint32_t p = prior_remote_acked; seq_compare(p, ack) < 0; p++) {
+     int a = ack_packet(stream, p, 0, &rs);
+diff --git a/src/udx_bbr.c b/src/udx_bbr.c
+index 625b8e6..5bc3e9d 100644
+--- a/src/udx_bbr.c
++++ b/src/udx_bbr.c
+@@ -154,11 +154,11 @@ bbr_on_transmit_start (udx_stream_t *stream, uint64_t now_ms) {
+ static uint32_t
+ bbr_bdp (udx_stream_t *stream, double bw, double gain) {
+ 
+-  if (stream->bbr.min_rtt_ms == ~0U) {
++  if (stream->bbr.min_rtt_us == ~0U) {
+     return 10; // cap at initial cwnd
+   }
+ 
+-  return max_uint32(bw * stream->bbr.min_rtt_ms * gain, 1);
++  return max_uint32(bw * (stream->bbr.min_rtt_us / 1000.0) * gain, 1);
+ }
+ 
+ static uint32_t
+@@ -469,9 +469,10 @@ bbr_update_min_rtt (udx_stream_t *stream, udx_rate_sample_t *rs) {
+ 
+   filter_expired = time_diff(now, stream->bbr.min_rtt_stamp + UDX_BBR_MIN_RTT_INTERVAL_MS) > 0;
+ 
+-  if (rs->rtt_ms >= 0 && (rs->rtt_ms < (int64_t) stream->bbr.min_rtt_ms || (filter_expired && !rs->is_ack_delayed))) {
+-    // round up to 1ms, since our timer has 1ms resolution
+-    stream->bbr.min_rtt_ms = rs->rtt_ms ? rs->rtt_ms : 1;
++  if (rs->rtt_us >= 0 && (rs->rtt_us < (int64_t) stream->bbr.min_rtt_us || (filter_expired && !rs->is_ack_delayed))) {
++    stream->bbr.min_rtt_us = rs->rtt_us ? rs->rtt_us : 1;
++    // the millisecond figure rounds up: it bounds a probing phase and is what callers read
++    stream->bbr.min_rtt_ms = (stream->bbr.min_rtt_us + 999) / 1000;
+     stream->bbr.min_rtt_stamp = now;
+   }
+ 
+@@ -564,6 +565,7 @@ bbr_init (udx_stream_t *stream) {
+   stream->bbr.probe_rtt_done_time = 0;
+   stream->bbr.probe_rtt_round_done = 0;
+   stream->bbr.min_rtt_ms = udx_rtt_min(stream);
++  stream->bbr.min_rtt_us = stream->bbr.min_rtt_ms == ~0U ? ~0U : stream->bbr.min_rtt_ms * 1000;
+   stream->bbr.min_rtt_stamp = uv_now(stream->udx->loop);
+ 
+   win_filter_f64_reset(&stream->bbr.bw, stream->bbr.rtt_count, 0);

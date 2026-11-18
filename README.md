@@ -149,6 +149,60 @@ datagram is processed, not with the loop's cached time, and its test is named fo
 in the same wakeup. It removes the stall here. #332 changes how many samples an acknowledgement
 yields, not where their time comes from, and leaves the stall as it is.
 
+## The same minimum, on a short path over a hop that delivers in bursts
+
+The minimum round trip is a whole number of milliseconds. On a path whose true round trip is
+about 2 ms it reads as 1 or 2 from one ten-second window to the next, and BBR sizes its window
+as `gain * bw * min_rtt`, so with 1 the window is half as large. Over a wired path that does not
+matter. Over a hop that delivers in bursts, as Wi-Fi does when it aggregates frames, the round
+trip under load is several milliseconds, a window sized for 1 ms cannot keep the hop full, the
+delivery rate falls and the bandwidth estimate follows it. The stream then runs at a quarter to
+a half of its rate until a later `PROBE_RTT` reads 2.
+
+`link.js --txop <ms>` emulates such a hop: both directions share one medium that carries one
+aggregate at a time, up to that much airtime, and everything in an aggregate arrives together.
+
+```
+node run-local.js --bytes 3000000000 --delay 0.7 --txop 4
+```
+
+The window calculation's inputs, printed once a second from an instrumented build on that hop:
+
+```
+min_rtt_ms 2  bdp 129  aggr  98  cwnd 227     (full rate)
+min_rtt_ms 1  bdp  51  aggr  50  cwnd 101     (slow, for the whole ten-second window)
+```
+
+### A change that removes both
+
+`libudx-microsecond-min-rtt.patch` (13 lines added, 6 removed; applies to libudx 9c9a0e7 and to
+main at e384532) records a packet's send time from `uv_hrtime()` as well, takes the round-trip
+sample for BBR in microseconds from a fresh reading when the acknowledgement is processed, and
+sizes the window from `min_rtt_us`. RACK, the retransmission timer and the rate sampler keep the
+millisecond clock. Because the sample no longer comes from the cached clock, the stall described
+above goes with it.
+
+Single stream, no encryption, udx-native 1.22.1 built from source, Apple M4:
+
+| Path | libudx 9c9a0e7 | with the patch |
+|---|---|---|
+| Wi-Fi 802.11ax 80 MHz, laptop to a wired machine, 4 GB, pair A | 41.1 MB/s | 47.8 MB/s |
+| the same, pair B (stock, patched, stock, patched within ten minutes) | 30.5 MB/s | 48.0 MB/s |
+| `--delay 0.7 --txop 4` | 32.4 to 35.0 MB/s | 39.8 MB/s |
+| `--delay 0.7 --txop 4`, libudx main e384532 | 35.6 MB/s | 41.5 MB/s |
+| control (400 Mbit/s, 10 ms) | 49.3 MB/s | 49.3 MB/s |
+| `--send-work 1.3` | 18 of 49 s stalled | 0 of 48 s stalled |
+
+With `PROBE_RTT` disabled the emulated hop carries 43.8 MB/s, but the minimum then drifts up with
+the queue and the hop drops packets, so that figure is a ceiling, not an alternative.
+
+`FINE=5 FINE_OUT=fine.txt` on a run samples the sender every 5 ms; `python3 episodes.py fine.txt`
+reports what each `PROBE_RTT` episode cost. On the Wi-Fi path an episode was followed by ten slow
+seconds about one time in five with libudx 9c9a0e7.
+
+Not covered: Windows or Linux as the sender, libudx's own test suite, and the rate sampler, which
+still measures its intervals in milliseconds.
+
 ## Where it was first seen
 
 Between two wired Macs at different sites, 11 ms apart, sending one large file through an
@@ -170,9 +224,11 @@ shows.
 | File | What |
 |---|---|
 | `pair.js` | one end of a bare udx stream: `send` or `recv`, prints once a second |
-| `link.js` | the emulated path: rate, delay and queue between two UDP ports |
+| `link.js` | the emulated path: rate, delay and queue between two UDP ports; `--txop` for a hop that delivers in bursts |
 | `run-local.js` | starts all three and counts the stalled seconds |
-| `libudx-current-clock.patch` | the change to libudx measured above |
+| `libudx-current-clock.patch` | the first change to libudx measured above |
+| `libudx-microsecond-min-rtt.patch` | the change that removes the stall and the slow state on a bursting hop |
+| `episodes.py` | reads a `FINE` sample file and reports each `PROBE_RTT` episode |
 | `inspect/` | a sender that logs the stream's internal state around the drop, with the field offsets it reads |
 
 `pair.js` also runs across two machines without `link.js`: start `recv` on one and `send` on the
