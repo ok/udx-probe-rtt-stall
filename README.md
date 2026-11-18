@@ -135,6 +135,20 @@ To compare a build of your own: `UDX_NATIVE=/path/to/udx-native node run-local.j
 The patch costs one clock read per packet sent and per datagram received. libudx's own test suite
 was not run against it, and it has not been tried on Linux or Windows.
 
+## Open pull requests on libudx, measured against this
+
+Each applied on its own to libudx 9c9a0e7 and run with `--send-work 1.3`, twice:
+
+| Pull request | Result |
+|---|---|
+| [#334](https://github.com/holepunchto/libudx/pull/334) "Fix/fresh rtt sample" (draft) | 40.7 and 41.0 MB/s, 0 seconds stalled |
+| [#332](https://github.com/holepunchto/libudx/pull/332) "generate 1 rtt sample per ACK" | 23.9 and 24.1 MB/s, 19 and 18 seconds stalled |
+
+#334 addresses this mechanism directly: it times an acknowledgement with a clock read when the
+datagram is processed, not with the loop's cached time, and its test is named for a long callback
+in the same wakeup. It removes the stall here. #332 changes how many samples an acknowledgement
+yields, not where their time comes from, and leaves the stall as it is.
+
 ## Where it was first seen
 
 Between two wired Macs at different sites, 11 ms apart, sending one large file through an
