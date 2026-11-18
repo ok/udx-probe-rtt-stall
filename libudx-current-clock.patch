@@ -1,0 +1,24 @@
+diff --git a/src/udx.c b/src/udx.c
+index 6c9daed..5cb7c75 100644
+--- a/src/udx.c
++++ b/src/udx.c
+@@ -712,6 +712,7 @@ _send_packet (udx_stream_t *stream, udx_packet_t *pkt, bool is_retransmit) {
+   if (pkt->transmits < 255) pkt->transmits++;
+   if (is_retransmit) pkt->retransmitted = true; // true if packet was _ever_ retransmitted
+ 
++  uv_update_time(stream->udx->loop);
+   pkt->time_sent = uv_now(stream->udx->loop);
+   udx__rate_pkt_sent(stream, pkt);
+ 
+@@ -1592,6 +1593,11 @@ static int
+ process_packet (udx_socket_t *socket, char *buf, ssize_t buf_len, struct sockaddr *addr) {
+   udx_t *udx = socket->udx;
+ 
++  // round trips are measured with uv_now(), which libuv refreshes once per loop iteration.
++  // several datagrams are read per iteration and application callbacks run between them, so
++  // without a refresh a packet sent in such a callback can be acked at the same reading.
++  uv_update_time(udx->loop);
++
+   socket->bytes_rx += buf_len;
+   socket->packets_rx += 1;
+ 

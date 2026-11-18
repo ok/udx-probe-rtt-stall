@@ -7,7 +7,8 @@
 // The field offsets are those of udx_stream_t in libudx 9c9a0e7 on darwin-arm64, as printed by
 // offsets.c; six of them are also exported by udx-native's binding and agree. For another
 // platform or version, build offsets.c against that libudx's headers and pass OFFSETS=<file>.
-const UDX = require('udx-native')
+// UDX_NATIVE points at another build of udx-native, for comparing a patched libudx.
+const UDX = require(process.env.UDX_NATIVE || 'udx-native')
 const O = require(process.env.OFFSETS || './offsets-darwin-arm64.json')
 const workMs = Number(process.env.WORK || 1.3)
 const total = Number(process.env.BYTES || 1.2e9)

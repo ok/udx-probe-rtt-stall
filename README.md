@@ -117,11 +117,23 @@ longer works between two datagrams of one read batch:
 Shortening each burst of work does not help, because every acknowledgement in the batch can
 start another one. Moving the work out of the receive path removes the stall.
 
-### A possible fix, not yet tried
+### A fix that removes it
 
-Take the two readings from a clock that is current: refresh the loop's time
-(`uv_update_time`) before stamping a packet and before computing a sample, or read a monotonic
-clock directly at both points. Not built or measured here.
+`libudx-current-clock.patch` (against libudx 9c9a0e7, six lines) refreshes the loop's clock with
+`uv_update_time` before a packet is stamped and before an incoming datagram is processed, so
+both readings are current. udx-native 1.22.1 built from source with and without it, same machine:
+
+| Run | libudx 9c9a0e7 | with the patch |
+|---|---|---|
+| `--send-work 1.3` | 24.2 MB/s, 19 of 49 s stalled | 39.7 MB/s, 0 of 30 |
+| `--send-work 1.3`, again | | 38.9 MB/s, 0 of 30 |
+| `--send-work 2.6` | | 21.8 MB/s, 0 of 55 |
+| control | 47.9 MB/s, 0 of 31 | 47.9 MB/s, 0 of 25 |
+
+To compare a build of your own: `UDX_NATIVE=/path/to/udx-native node run-local.js --send-work 1.3`.
+
+The patch costs one clock read per packet sent and per datagram received. libudx's own test suite
+was not run against it, and it has not been tried on Linux or Windows.
 
 ## Where it was first seen
 
@@ -146,6 +158,7 @@ shows.
 | `pair.js` | one end of a bare udx stream: `send` or `recv`, prints once a second |
 | `link.js` | the emulated path: rate, delay and queue between two UDP ports |
 | `run-local.js` | starts all three and counts the stalled seconds |
+| `libudx-current-clock.patch` | the change to libudx measured above |
 | `inspect/` | a sender that logs the stream's internal state around the drop, with the field offsets it reads |
 
 `pair.js` also runs across two machines without `link.js`: start `recv` on one and `send` on the

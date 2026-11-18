@@ -6,7 +6,8 @@
 // The sender writes generated data as fast as the stream takes it and prints the stream's own
 // figures once a second; the receiver prints what arrived. Both ends must be started with each
 // other's address. Stream ids are fixed: sender 1, receiver 2.
-const UDX = require('udx-native')
+// UDX_NATIVE points at another build of udx-native, for comparing a patched libudx.
+const UDX = require(process.env.UDX_NATIVE || 'udx-native')
 
 const args = process.argv.slice(2)
 const mode = args[0]
