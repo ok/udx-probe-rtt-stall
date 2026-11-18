@@ -12,8 +12,9 @@ multiplexing, no DHT.
 
 ```
 npm install
-node run-local.js --send-work 1.3      # stalls
-node run-local.js                      # control: does not stall
+node run-local.js --send-work 1.3            # stalls
+node run-local.js                            # control: does not stall
+node run-local.js --send-work 1.3 --defer    # same work, outside the receive path: does not stall
 ```
 
 `run-local.js` starts three processes: a sender, a receiver, and a link between them that
@@ -38,8 +39,9 @@ udx-native 1.22.1, Node 24.19.0, macOS 27.2.1, Apple M4, 1.2 GB per run.
 | `--send-work 1.3`, again | 23.9 MB/s | 39.1 MB/s | 19 of 50 |
 | `--send-work 1.3`, again | 24.2 MB/s | 41.1 MB/s | 19 of 49 |
 
-So the condition is a busy sending thread. A sender that is merely slower than the path, but
-idle between its writes, does not stall, and neither does a busy receiver.
+So the condition is a sending thread that is busy inside the stream's callbacks. A sender that
+is merely slower than the path, but idle between its writes, does not stall, and neither does a
+busy receiver.
 
 Seconds 8 to 24 of a stalling run:
 
@@ -63,11 +65,63 @@ Seconds 8 to 24 of a stalling run:
   24s send   41.9 MB/s  cwnd   582  inflight   772464  rtt   15  bbr state 2 bw   43.3 MB/s retransmits 0  rto 0
 ```
 
-A stalled block starts every ten seconds, the interval at which BBR's minimum round-trip filter
-expires and the stream enters `PROBE_RTT` (`UDX_BBR_MIN_RTT_INTERVAL_MS`, `src/udx_bbr.c` in libudx). In the control run
-the same moment costs one slower second (about 38 instead of 49 MB/s) and the stream carries on.
-With a busy sending thread the window and the bandwidth estimate stay at the floor for the next
-ten seconds, until the following probe.
+## Cause
+
+The stream measures a round trip as the difference between two readings of the event loop's
+cached clock: `pkt->time_sent = uv_now(loop)` when a packet is sent and `uv_now(loop)` again when
+its acknowledgement is processed (`_send_packet` and `ack_packet` in libudx `src/udx.c`). libuv
+refreshes that clock once per loop iteration. It reads up to 32 datagrams per iteration from a
+readable socket, and an application callback can run between two of them: processing an
+acknowledgement makes the stream writable, `drain` fires, and the application writes.
+
+If those callbacks together take longer than the path's round trip, packets sent in them are
+acknowledged within the same iteration, by datagrams that arrived while the application was
+working. Both readings of the clock are then the same and the sample is 0 ms, recorded as 1 ms.
+
+BBR takes any sample below its minimum as the new minimum round trip. With 1 ms in place of
+10 ms the bandwidth-delay product is a tenth of what it should be, the congestion window is cut
+to match, the stream becomes window-limited, each delivery-rate sample is lower than the last,
+and window and bandwidth estimate fall together to the floor of 4 packets. Nothing corrects the
+1 ms until the minimum's ten-second window expires and the next `PROBE_RTT` measures the path
+again, which is why a stalled block lasts ten seconds.
+
+It happens at the end of `PROBE_RTT` because that is when the window jumps from 4 packets back
+to several hundred and the application, which has been waiting, writes a large burst at once.
+
+What the stream's own structure shows at that moment (`inspect/inspect-send.js`; time in ms,
+window and delivered in packets):
+
+```
+t 10241.2  PROBE_RTT  cwnd   4  min_rtt  8  srtt  9  delivered 290176  next seq 290180
+t 10249.8  PROBE_BW   cwnd 516  min_rtt  8  srtt  9  delivered 290177  next seq 290402
+t 10264.8  PROBE_BW   cwnd  96  min_rtt  1  srtt  1  delivered 290209  next seq 290435
+```
+
+Between the second and third line the application worked for 15 ms. Then 32 acknowledgements,
+one read batch, were processed with the clock still at the value the packets were stamped with:
+the smoothed round trip fell from 9 ms to 1 ms and the minimum with it.
+
+### The test that confirms it
+
+`--defer` makes the sender continue writing on a later turn of the event loop instead of inside
+the `drain` callback. It does the same work and its thread is as busy as before, but it no
+longer works between two datagrams of one read batch:
+
+| Run | Average | Stalled seconds |
+|---|---|---|
+| `--send-work 1.3` | 24.2 MB/s | 19 of 49 |
+| `--send-work 1.3 --slice 4` (no burst of work longer than 4 ms) | 24.2 MB/s | 19 of 49 |
+| `--send-work 1.3 --defer` | 40.1 MB/s | 0 of 29 |
+| `--send-work 1.3 --slice 4 --defer` | 41.0 MB/s | 0 of 29 |
+
+Shortening each burst of work does not help, because every acknowledgement in the batch can
+start another one. Moving the work out of the receive path removes the stall.
+
+### A possible fix, not yet tried
+
+Take the two readings from a clock that is current: refresh the loop's time
+(`uv_update_time`) before stamping a packet and before computing a sample, or read a monotonic
+clock directly at both points. Not built or measured here.
 
 ## Where it was first seen
 
@@ -80,9 +134,10 @@ shows.
 
 ## Not established
 
-- Why the estimate does not recover after the probe ends. The reproduction shows that it does
-  not; the cause inside the congestion control has not been traced.
-- Whether a busy thread is the only trigger.
+- Whether the same stale reading matters elsewhere in the stream: the retransmission timer, the
+  loss probe and the reordering window are all derived from the same samples.
+- How often it occurs in applications whose callbacks are shorter than the round trip. On a path
+  with a longer round trip the same work would not trigger it.
 
 ## Files
 
@@ -91,6 +146,7 @@ shows.
 | `pair.js` | one end of a bare udx stream: `send` or `recv`, prints once a second |
 | `link.js` | the emulated path: rate, delay and queue between two UDP ports |
 | `run-local.js` | starts all three and counts the stalled seconds |
+| `inspect/` | a sender that logs the stream's internal state around the drop, with the field offsets it reads |
 
 `pair.js` also runs across two machines without `link.js`: start `recv` on one and `send` on the
 other, each with the other's address as `--peer`.

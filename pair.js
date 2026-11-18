@@ -21,7 +21,7 @@ const frameBytes = Number(opt('frame', 65536))
 // The most the sending application supplies, in MB/s; 0 supplies as fast as the stream takes it.
 const supply = Number(opt('supply', 0)) * 1e6
 if (!['send', 'recv'].includes(mode) || !port || !peerPort) {
-  console.error('usage: node pair.js send|recv --port <local> --peer <host:port> [--bytes n] [--frame n] [--supply MB/s]')
+  console.error('usage: node pair.js send|recv --port <local> --peer <host:port> [--bytes n] [--frame n] [--supply MB/s] [--work ms] [--slice ms]')
   process.exit(1)
 }
 
@@ -33,6 +33,14 @@ function work() {
   const until = performance.now() + workMs
   while (performance.now() < until) { /* busy */ }
 }
+
+// The longest the sender works in one go before handing the thread back to the event loop, in
+// ms; 0 keeps writing until the stream pushes back, however long that takes.
+const sliceMs = Number(opt('slice', 0))
+
+// With --defer the sender never continues writing from inside the stream's own callback: the
+// continuation runs on a later turn of the event loop.
+const defer = args.includes('--defer')
 
 const udx = new UDX()
 const socket = udx.createSocket()
@@ -74,12 +82,14 @@ if (sending) {
   // sender does whose own work (reading, encrypting) is slower than the path.
   let allowance = supply ? 0 : Infinity
   const pump = () => {
+    const sliceEnd = sliceMs ? performance.now() + sliceMs : Infinity
     while (moved < total && allowance >= frameBytes) {
+      if (performance.now() >= sliceEnd) return setImmediate(pump)
       const size = Math.min(frameBytes, total - moved)
       moved += size
       allowance -= size
       work()
-      if (!stream.write(size === frameBytes ? frame : frame.subarray(0, size))) return stream.once('drain', pump)
+      if (!stream.write(size === frameBytes ? frame : frame.subarray(0, size))) return stream.once('drain', defer ? () => setImmediate(pump) : pump)
     }
     if (moved >= total) stream.end()
   }
