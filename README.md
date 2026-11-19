@@ -149,71 +149,75 @@ datagram is processed, not with the loop's cached time, and its test is named fo
 in the same wakeup. It removes the stall here. #332 changes how many samples an acknowledgement
 yields, not where their time comes from, and leaves the stall as it is.
 
-## The same minimum, on a short path over a hop that delivers in bursts
+## Two changes on libudx main, measured
 
-The minimum round trip is a whole number of milliseconds. On a path whose true round trip is
-about 2 ms it reads as 1 or 2 from one ten-second window to the next, and BBR sizes its window
-as `gain * bw * min_rtt`, so with 1 the window is half as large. Over a wired path that does not
-matter. Over a hop that delivers in bursts, as Wi-Fi does when it aggregates frames, the round
-trip under load is several milliseconds, a window sized for 1 ms cannot keep the hop full, the
-delivery rate falls and the bandwidth estimate follows it. The stream then runs at a quarter to
-a half of its rate until a later `PROBE_RTT` reads 2.
+Both are on https://github.com/ok/libudx, each on its own on libudx main (fb2d472) and together.
+Every commit carries a unit test; libudx's suite passes on each branch.
 
-`link.js --txop <ms>` emulates such a hop: both directions share one medium that carries one
-aggregate at a time, up to that much airtime, and everything in an aggregate arrives together.
+| Branch | Change |
+|---|---|
+| [`proposal/min-rtt-us`](https://github.com/ok/libudx/commits/proposal/min-rtt-us) | BBR's round-trip sample comes from a fresh `uv_hrtime()` reading, in microseconds, and the window is sized from `min_rtt_us`. RACK, the retransmission timer and the rate sampler keep the millisecond clock. |
+| [`proposal/window-budget`](https://github.com/ok/libudx/commits/proposal/window-budget) | `bbr_bdp` rounds up and the window target gets a quantization budget of three send quanta, as Linux BBRv1 does. |
+| [`proposal/combined`](https://github.com/ok/libudx/commits/proposal/combined) | both |
+
+### The stall (this repository's reproduction)
+
+`node run-local.js --send-work 1.3`, 2 GB, two runs each, seconds below a tenth of the typical rate:
+
+| libudx | Run 1 | Run 2 | Control without `--send-work` |
+|---|---|---|---|
+| 9c9a0e7 (udx-native 1.22.x) | 37 of 90 | 37 of 90 | 49 MB/s, none |
+| main fb2d472 | 38 of 90 | 29 of 82 | 49 MB/s, none |
+| main + `min-rtt-us` | 0 of 49 | 0 of 50 | 49 MB/s, none |
+| main + `window-budget` | 20 of 86 | 20 of 77 | 49 MB/s, none |
+| main + both | 0 of 50 | 5 of 59 | 49 MB/s, none |
+
+The fresh sample removes the stall; the window budget does not, and is not meant to.
+
+### A Wi-Fi link
+
+A wired Windows machine sends to a laptop on 802.11ax, 5 GHz, 80 MHz, link rate 650 to 865 Mbit/s.
+One stream, no encryption, 8 to 12 GB per run, runs back to back in mixed order on one morning.
+A slow stretch is four seconds or more below 60 % of the run's median.
+
+| libudx (both ends) | Runs, MB/s | Slow stretches per run | Packets resent |
+|---|---|---|---|
+| 9c9a0e7 (udx-native 1.22.x) | 39.7, 41.5 | 5, 3 | 0.04 to 0.09 % |
+| main fb2d472 | 53.8, 51.7, 51.4, 55.4, 51.3, 55.9, 56.2 | 1, 2, 1, 0, 1, 0, 0 | 0.005 to 0.11 % |
+| main + `window-budget` | 55.5, 59.7, 58.3 | none | 0.1 to 0.23 % |
+| main + both | 57.9, 57.0, 60.7, 60.2, 60.1, 59.2 | none | 0.04 to 0.23 % |
+
+The slow stretches start and end on a `PROBE_RTT`, with the window at 100 to 200 packets where it
+is 700 to 1000 otherwise: the target `2 * bw * min_rtt` holds less than one loaded round trip on
+this link, the delivery rate falls, and the bandwidth filter follows it until the next probe.
+
+Inside an application (encrypted, multiplexed, 20 GB file, same link): 42.1 MB/s with udx-native
+1.22.x and four slow stretches; 56.0 MB/s with main + both and none.
+
+### What is not shown
+
+- `min-rtt-us` on its own over the Wi-Fi link under the same conditions. An earlier night's runs
+  showed no gain over main there, but those runs were disturbed (next point).
+- An earlier version of this section reported that main + `min-rtt-us` collapsed on a long run
+  over this link. That run, and every Wi-Fi figure taken before the morning above, was made
+  while the access point's radio was overheating and cutting its output; the collapse did not
+  recur once that was controlled. It is withdrawn, not explained.
+- A real internet path. The stall figures are from the emulated one.
+- Linux as a sender; macOS only as a receiver on the Wi-Fi link.
+- Why the window budget resends more. The larger window puts more in flight when a queue
+  overflows; whether that is all of it was not examined.
+
+### The emulated hop that delivers in bursts
+
+`link.js --txop <ms>` makes both directions share one medium that carries one aggregate at a
+time, up to that much airtime, and everything in an aggregate arrives together:
 
 ```
 node run-local.js --bytes 3000000000 --delay 0.7 --txop 4
 ```
 
-The window calculation's inputs, printed once a second from an instrumented build on that hop:
-
-```
-min_rtt_ms 2  bdp 129  aggr  98  cwnd 227     (full rate)
-min_rtt_ms 1  bdp  51  aggr  50  cwnd 101     (slow, for the whole ten-second window)
-```
-
-### A change that removes both
-
-> **Later finding: this patch is not a fix as it stands.** The figures in this section are from
-> runs of 25 to 100 seconds. On a 12 GB run over the same Wi-Fi in the other direction, libudx
-> main with this patch on both ends averaged 21.8 MB/s (median 9.9) against 36.0 MB/s (median
-> 40.7) for udx-native 1.22.1. There the unloaded round trip is about 1.4 ms and the loaded one
-> 3 ms or more, so a window of `2 * bw * min_rtt` with the exact minimum holds less than one
-> loaded round trip and the rate shrinks; rounding 1.4 ms up to 2 ms, as the released library
-> does, happens to leave enough room. The same run also showed bandwidth samples of several times
-> the link rate right after `PROBE_RTT`, followed by a burst and loss. The whole-millisecond
-> minimum is still the cause of the slow state described above, but a finer minimum alone trades
-> one failure for another on such paths.
-
-
-`libudx-microsecond-min-rtt.patch` (13 lines added, 6 removed; applies to libudx 9c9a0e7 and to
-main at e384532) records a packet's send time from `uv_hrtime()` as well, takes the round-trip
-sample for BBR in microseconds from a fresh reading when the acknowledgement is processed, and
-sizes the window from `min_rtt_us`. RACK, the retransmission timer and the rate sampler keep the
-millisecond clock. Because the sample no longer comes from the cached clock, the stall described
-above goes with it.
-
-Single stream, no encryption, udx-native 1.22.1 built from source, Apple M4:
-
-| Path | libudx 9c9a0e7 | with the patch |
-|---|---|---|
-| Wi-Fi 802.11ax 80 MHz, laptop to a wired machine, 4 GB, pair A | 41.1 MB/s | 47.8 MB/s |
-| the same, pair B (stock, patched, stock, patched within ten minutes) | 30.5 MB/s | 48.0 MB/s |
-| `--delay 0.7 --txop 4` | 32.4 to 35.0 MB/s | 39.8 MB/s |
-| `--delay 0.7 --txop 4`, libudx main e384532 | 35.6 MB/s | 41.5 MB/s |
-| control (400 Mbit/s, 10 ms) | 49.3 MB/s | 49.3 MB/s |
-| `--send-work 1.3` | 18 of 49 s stalled | 0 of 48 s stalled |
-
-With `PROBE_RTT` disabled the emulated hop carries 43.8 MB/s, but the minimum then drifts up with
-the queue and the hop drops packets, so that figure is a ceiling, not an alternative.
-
-`FINE=5 FINE_OUT=fine.txt` on a run samples the sender every 5 ms; `python3 episodes.py fine.txt`
-reports what each `PROBE_RTT` episode cost. On the Wi-Fi path an episode was followed by ten slow
-seconds about one time in five with libudx 9c9a0e7.
-
-Not covered: Windows or Linux as the sender, libudx's own test suite, and the rate sampler, which
-still measures its intervals in milliseconds.
+`UDX_NATIVE=/path/to/udx-native` selects the library build. `FINE=5 FINE_OUT=fine.txt` samples the
+sender every 5 ms; `python3 episodes.py fine.txt` reports what each `PROBE_RTT` episode cost.
 
 ## Where it was first seen
 
@@ -239,7 +243,7 @@ shows.
 | `link.js` | the emulated path: rate, delay and queue between two UDP ports; `--txop` for a hop that delivers in bursts |
 | `run-local.js` | starts all three and counts the stalled seconds |
 | `libudx-current-clock.patch` | the first change to libudx measured above |
-| `libudx-microsecond-min-rtt.patch` | the change that removes the stall and the slow state on a bursting hop |
+| `libudx-microsecond-min-rtt.patch` | an early form of `proposal/min-rtt-us`, against libudx 9c9a0e7 |
 | `episodes.py` | reads a `FINE` sample file and reports each `PROBE_RTT` episode |
 | `inspect/` | a sender that logs the stream's internal state around the drop, with the field offsets it reads |
 
