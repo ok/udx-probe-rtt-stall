@@ -158,7 +158,7 @@ Every commit carries a unit test; libudx's suite passes on each branch.
 |---|---|
 | [`proposal/min-rtt-us`](https://github.com/ok/libudx/commits/proposal/min-rtt-us) | BBR's round-trip sample comes from a fresh `uv_hrtime()` reading, in microseconds, and the window is sized from `min_rtt_us`. RACK, the retransmission timer and the rate sampler keep the millisecond clock. |
 | [`proposal/window-budget`](https://github.com/ok/libudx/commits/proposal/window-budget) | `bbr_bdp` rounds up and the window target gets a quantization budget of three send quanta, as Linux BBRv1 does. |
-| [`proposal/combined`](https://github.com/ok/libudx/commits/proposal/combined) | both |
+| [`proposal/combined`](https://github.com/ok/libudx/commits/proposal/combined) | both: the window budget first, the fresh sample on top |
 
 ### The stall (this repository's reproduction)
 
@@ -172,7 +172,8 @@ Every commit carries a unit test; libudx's suite passes on each branch.
 | main + `window-budget` | 20 of 86 | 20 of 77 | 49 MB/s, none |
 | main + both | 0 of 50 | 5 of 59 | 49 MB/s, none |
 
-The fresh sample removes the stall; the window budget does not, and is not meant to.
+The fresh sample removes the stall; the window budget does not, and is not meant to. But the fresh
+sample must not be applied alone: see the Linux sender below.
 
 ### A Wi-Fi link
 
@@ -194,16 +195,53 @@ this link, the delivery rate falls, and the bandwidth filter follows it until th
 Inside an application (encrypted, multiplexed, 20 GB file, same link): 42.1 MB/s with udx-native
 1.22.x and four slow stretches; 56.0 MB/s with main + both and none.
 
+### Other senders and paths
+
+A wired Linux machine (Arch, kernel 7.2, Ryzen) sends to the same laptop on Wi-Fi, 8 GB per run,
+two rounds in mixed order. The access point's radio was hot in several of these runs (it exceeded
+105 °C in most of round 2), so compare builds, not levels.
+
+| libudx, both ends | Runs, MB/s | Window, median packets |
+|---|---|---|
+| 9c9a0e7 (udx-native 1.22.x) | 24.1, 29.0 | 108, 134 |
+| main fb2d472 | 39.7, 45.0 | 253, 327 |
+| main + `min-rtt-us` only | **9.8, 10.5** | 15, 16 |
+| main + `window-budget` | 55.7, 54.9 | 644, 717 |
+| main + both | 51.7, 52.4 | 451, 453 |
+
+**`min-rtt-us` on its own makes this path much worse.** The run starts at 30 to 35 MB/s and
+within half a minute the window sits at 7 to 16 packets. With an exact minimum of well under
+2 ms, `2 * bw * min_rtt` is smaller than with the minimum rounded up to a whole millisecond, and
+the shrinking described above sets in for good. With the window budget underneath it does not.
+So the fresh sample belongs on top of the window budget, never alone;
+`proposal/combined` has them in that order.
+
+Both machines on the Wi-Fi network (the Windows sender on 802.11ac, so every packet crosses the
+air twice), 4 GB per run: 9c9a0e7 18.1, 17.0; main 21.7, 20.8, 20.6, 22.0; main + `min-rtt-us`
+only 20.5, 21.5, 22.0; main + `window-budget` 24.0, 24.1; main + both 24.0, 24.2 MB/s.
+
+Linux and Windows on gigabit Ethernet, 8 GB per run, two rounds:
+
+| libudx, both ends | Linux to Windows, MB/s | Windows to Linux, MB/s |
+|---|---|---|
+| 9c9a0e7 (udx-native 1.22.x) | 110.0, 111.3 | 115.9, 115.9 |
+| main fb2d472 | 103.9, 111.1 | 115.9, 115.8 |
+| main + `min-rtt-us` only | 115.4, 115.4 | 115.8, 115.6 |
+| main + `window-budget` | 112.2, 109.3 | 115.9, 115.9 |
+| main + both | 107.0, 111.0 | 115.9, 115.9 |
+
+All at the link's limit. Windows to Linux resent no packet in any run; Linux to Windows resent
+0.03 to 1.1 % in every build, without a pattern by build.
+
 ### What is not shown
 
-- `min-rtt-us` on its own over the Wi-Fi link under the same conditions. An earlier night's runs
-  showed no gain over main there, but those runs were disturbed (next point).
 - An earlier version of this section reported that main + `min-rtt-us` collapsed on a long run
-  over this link. That run, and every Wi-Fi figure taken before the morning above, was made
-  while the access point's radio was overheating and cutting its output; the collapse did not
-  recur once that was controlled. It is withdrawn, not explained.
+  over the Wi-Fi link with the Windows sender, and a later version withdrew that because the
+  access point had been overheating during it. The Linux runs above show the same collapse with
+  the radio cool, so the first report was probably right. It was not repeated with the Windows
+  sender under controlled conditions.
 - A real internet path. The stall figures are from the emulated one.
-- Linux as a sender; macOS only as a receiver on the Wi-Fi link.
+- macOS as a sender on the Wi-Fi link.
 - Why the window budget resends more. The larger window puts more in flight when a queue
   overflows; whether that is all of it was not examined.
 
